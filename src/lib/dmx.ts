@@ -38,6 +38,46 @@ export interface TrialResult {
   canCommit: boolean;
 }
 
+/** 双灯具原子互换中单方（一盏灯）的预演结果。 */
+export interface SwapSide {
+  /** 预演时刻该灯具的快照（footprint 随原灯具，不参与互换）。 */
+  fixture: Fixture;
+  /** 互换后的目标 universe（对方原位）。 */
+  targetUniverse: number;
+  /** 互换后的目标 start（对方原位）。 */
+  targetStart: number;
+  /** 通道上界：targetStart + fixture.footprint ≤ 513。 */
+  inBounds: boolean;
+  /** 原位直接冲突 id（当前补丁，不含自身，UTF-8 字节序）。 */
+  origin: string[];
+  /** 目标位直接冲突 id（完整候选补丁口径，含相互重叠时的对方，UTF-8 字节序）。 */
+  target: string[];
+  /** 候选相对原位新增的直接冲突 id（target 有、origin 无，UTF-8 字节序）。 */
+  added: string[];
+  /** 候选相对原位消解的直接冲突 id（origin 有、target 无，UTF-8 字节序）。 */
+  removed: string[];
+}
+
+/** 双灯具原子互换预演：在完整候选补丁上统一核验，绝不基于逐盏试移的临时状态。 */
+export interface SwapPreview {
+  /** 预演所依据的引擎修订；提交时必须仍为当前修订。 */
+  revision: number;
+  a: SwapSide;
+  b: SwapSide;
+  /** 两灯在候选补丁的新位置上是否相互重叠（无条件拒绝，即使该冲突对原本就存在）。 */
+  mutualOverlap: boolean;
+  /** 通道合法、两灯不相互重叠、且对其他灯具均无新增冲突时为 true。 */
+  canCommit: boolean;
+}
+
+/** 原子互换提交结果。 */
+export interface SwapCommitResult {
+  /** committed：一次生效；rejected：合法性核验未过；stale：预演修订已过期。 */
+  status: "committed" | "rejected" | "stale";
+  /** committed/rejected 时附带当前引擎状态下重新算出的预演；stale 时为 null。 */
+  preview: SwapPreview | null;
+}
+
 /** 灯具占用的闭区间右端点（含）。 */
 export function endOf(f: Pick<Fixture, "start" | "footprint">): number {
   return f.start + f.footprint - 1;
@@ -190,6 +230,11 @@ export class PatchEngine {
   /** 每个 universe 的灯具数组，按 (start, id 字节序) 排序。 */
   private readonly byUniverse = new Map<number, Fixture[]>();
   private readonly groupsByUniverse = new Map<number, ConflictGroup[]>();
+  /**
+   * 引擎修订：构造为 0，每次成功写回（单灯提交/双灯互换提交）递增。
+   * 预演携带当时的修订；提交时修订不符即过期，调用方须重新预演。
+   */
+  private rev = 0;
 
   constructor(patch: Fixture[]) {
     for (const f of patch) {
@@ -219,6 +264,11 @@ export class PatchEngine {
     return this.fixtures.size;
   }
 
+  /** 当前引擎修订；成功写回一次即 +1。 */
+  get revision(): number {
+    return this.rev;
+  }
+
   getFixture(id: string): Fixture | undefined {
     const f = this.fixtures.get(id);
     return f ? { ...f } : undefined;
@@ -240,13 +290,14 @@ export class PatchEngine {
 
   /**
    * 列出与区间 [start, start+footprint-1] 在指定 universe 内直接冲突的灯具 id
-   * （排除 excludeId 自身），按 UTF-8 字节序。
+   * （排除 excludeId 自身以及另一盏互换灯 otherExcludeId，若给出），按 UTF-8 字节序。
    */
   private conflictsAt(
     universe: number,
     start: number,
     footprint: number,
     excludeId: string,
+    otherExcludeId?: string,
   ): string[] {
     const arr = this.byUniverse.get(universe);
     if (!arr || arr.length === 0) return [];
@@ -264,7 +315,7 @@ export class PatchEngine {
     for (let i = a; i < arr.length; i++) {
       const f = arr[i];
       if (f.start > end) break;
-      if (f.id !== excludeId && endOf(f) >= start) hits.push(f.id);
+      if (f.id !== excludeId && f.id !== otherExcludeId && endOf(f) >= start) hits.push(f.id);
     }
     hits.sort((x, y) => compareBytes(this.idBytes.get(x)!, this.idBytes.get(y)!));
     return hits;
@@ -311,7 +362,7 @@ export class PatchEngine {
 
   /**
    * 提交移动：仅当目标位直接冲突列表为空时生效，并重算受影响 universe 的
-   * 冲突组；否则补丁保持不变。返回提交时的试移结果。
+   * 冲突组；否则补丁保持不变。返回提交时的试移结果。成功写回使引擎修订 +1。
    */
   commit(id: string, universe: number, start: number): TrialResult | null {
     const trial = this.trialMove(id, universe, start);
@@ -335,7 +386,178 @@ export class PatchEngine {
       this.groupsByUniverse.set(oldUniverse, this.sweep(oldUniverse, oldArr));
     }
     this.groupsByUniverse.set(universe, this.sweep(universe, newArr));
+    this.rev += 1;
     return trial;
+  }
+
+  /**
+   * 双灯具原子互换预演：按逐字节精确的两个不同 id 选灯，互换各自 universe 与
+   * 起始通道，footprint 仍随原灯具。所有核验都在“两灯同时落到新位置”的完整
+   * 候选补丁口径上一次性完成——通道上界、两灯相互重叠、以及与其他灯具的新增
+   * 冲突，绝不以逐盏试移的临时状态（对方仍占着目标通道）作结论。
+   *
+   * id 之一不存在或两者逐字节相同返回 null（非法请求，调用方只提示，不改状态）。
+   */
+  previewSwap(idA: string, idB: string): SwapPreview | null {
+    if (idA === idB) return null;
+    const a = this.fixtures.get(idA);
+    const b = this.fixtures.get(idB);
+    if (!a || !b) return null;
+    const revision = this.rev;
+
+    // 通道上界：footprint 随原灯具，仅换 universe/start（对方当前位置必在合法域）。
+    const aBounds =
+      isValidUniverse(b.universe) &&
+      isIntBetween(b.start, MIN_CHANNEL, MAX_CHANNEL) &&
+      b.start + a.footprint <= MAX_CHANNEL + 1;
+    const bBounds =
+      isValidUniverse(a.universe) &&
+      isIntBetween(a.start, MIN_CHANNEL, MAX_CHANNEL) &&
+      a.start + b.footprint <= MAX_CHANNEL + 1;
+
+    // 两灯在候选位置上是否相互重叠（与该对在原补丁中是否冲突无关：无条件拒绝）。
+    const mutualOverlap = this.overlapsAt(
+      b.universe,
+      b.start,
+      a.footprint,
+      a.universe,
+      a.start,
+      b.footprint,
+    );
+
+    // 原位直接冲突（当前补丁口径，含对方）。
+    const aOrigin = this.conflictsAt(a.universe, a.start, a.footprint, idA);
+    const bOrigin = this.conflictsAt(b.universe, b.start, b.footprint, idB);
+
+    // 目标位直接冲突（完整候选补丁口径）：与“其他灯具”的关系通过只读索引查询
+    // 并排除互换双方（双方此刻都不在原位）；两灯彼此关系由 mutualOverlap 单独给出。
+    const aTargetOthers = this.conflictsAt(b.universe, b.start, a.footprint, idA, idB);
+    const bTargetOthers = this.conflictsAt(a.universe, a.start, b.footprint, idB, idA);
+    const aTarget = mutualOverlap ? this.mergeSorted(aTargetOthers, idB) : aTargetOthers;
+    const bTarget = mutualOverlap ? this.mergeSorted(bTargetOthers, idA) : bTargetOthers;
+
+    // 候选冲突变化：目标位（候选口径）相对原位的新增/消解，均按 UTF-8 字节序。
+    // 新增中对“其他灯具”的部分决定合法性；对“对方”的新增已由 mutualOverlap 兜住。
+    const aAdded = aTarget.filter((id) => !aOrigin.includes(id));
+    const bAdded = bTarget.filter((id) => !bOrigin.includes(id));
+    const aRemoved = aOrigin.filter((id) => !aTarget.includes(id));
+    const bRemoved = bOrigin.filter((id) => !bTarget.includes(id));
+
+    const canCommit =
+      aBounds && bBounds && !mutualOverlap && aAdded.length === 0 && bAdded.length === 0;
+
+    const makeSide = (
+      f: Fixture,
+      targetUniverse: number,
+      targetStart: number,
+      inBounds: boolean,
+      origin: string[],
+      target: string[],
+      added: string[],
+      removed: string[],
+    ): SwapSide => ({
+      fixture: { ...f },
+      targetUniverse,
+      targetStart,
+      inBounds,
+      origin,
+      target,
+      added,
+      removed,
+    });
+
+    return {
+      revision,
+      a: makeSide(a, b.universe, b.start, aBounds, aOrigin, aTarget, aAdded, aRemoved),
+      b: makeSide(b, a.universe, a.start, bBounds, bOrigin, bTarget, bAdded, bRemoved),
+      mutualOverlap,
+      canCommit,
+    };
+  }
+
+  /**
+   * 原子互换提交：仅当预演修订仍是当前修订、且在当前补丁上重新预演仍可提交时
+   * 一次生效。过期（任何成功写回都会推进修订）返回 stale 且不改变任何状态；
+   * 当前核验未过返回 rejected，补丁、冲突组同样保持不变。
+   */
+  commitSwap(preview: SwapPreview): SwapCommitResult {
+    if (preview.revision !== this.rev) return { status: "stale", preview: null };
+    const idA = preview.a.fixture.id;
+    const idB = preview.b.fixture.id;
+    const fresh = this.previewSwap(idA, idB);
+    if (!fresh || !fresh.canCommit) {
+      return { status: "rejected", preview: fresh };
+    }
+
+    const a = this.fixtures.get(idA)!;
+    const b = this.fixtures.get(idB)!;
+    const affected = new Set<number>([a.universe, b.universe, fresh.a.targetUniverse]);
+    // 先从原有序数组摘除（两灯在同一 universe 时各自按当前数组重算下界）。
+    const aOldArr = this.byUniverse.get(a.universe)!;
+    aOldArr.splice(this.lowerBound(aOldArr, a.start, a.id), 1);
+    const bOldArr = this.byUniverse.get(b.universe)!;
+    bOldArr.splice(this.lowerBound(bOldArr, b.start, b.id), 1);
+    for (const u of affected) {
+      const arr = this.byUniverse.get(u);
+      if (arr && arr.length === 0) {
+        this.byUniverse.delete(u);
+        this.groupsByUniverse.delete(u);
+      }
+    }
+    // 同时落到对方的 universe/start（footprint 不变）。
+    const aNewUniverse = fresh.a.targetUniverse;
+    const aNewStart = fresh.a.targetStart;
+    const bNewUniverse = fresh.b.targetUniverse;
+    const bNewStart = fresh.b.targetStart;
+    a.universe = aNewUniverse;
+    a.start = aNewStart;
+    b.universe = bNewUniverse;
+    b.start = bNewStart;
+    const insert = (f: Fixture) => {
+      let arr = this.byUniverse.get(f.universe);
+      if (!arr) {
+        arr = [];
+        this.byUniverse.set(f.universe, arr);
+      }
+      arr.splice(this.lowerBound(arr, f.start, f.id), 0, f);
+    };
+    insert(a);
+    insert(b);
+    for (const u of affected) {
+      const arr = this.byUniverse.get(u);
+      if (arr) this.groupsByUniverse.set(u, this.sweep(u, arr));
+      else this.groupsByUniverse.delete(u);
+    }
+    this.rev += 1;
+    return { status: "committed", preview: this.previewSwap(idA, idB) };
+  }
+
+  /** 把单个 id 按 UTF-8 字节序并入已排序 id 列表（用于补入相互重叠的对方）。 */
+  private mergeSorted(sorted: string[], id: string): string[] {
+    const idB = this.idBytes.get(id)!;
+    const out: string[] = [];
+    let inserted = false;
+    for (const x of sorted) {
+      if (!inserted && compareBytes(this.idBytes.get(x)!, idB) > 0) {
+        out.push(id);
+        inserted = true;
+      }
+      out.push(x);
+    }
+    if (!inserted) out.push(id);
+    return out;
+  }
+
+  /** 两个闭区间（可在不同 universe）是否相交：同 universe 且端点相接即相交。 */
+  private overlapsAt(
+    u1: number,
+    s1: number,
+    fp1: number,
+    u2: number,
+    s2: number,
+    fp2: number,
+  ): boolean {
+    return u1 === u2 && s1 <= s2 + fp2 - 1 && s2 <= s1 + fp1 - 1;
   }
 
   /** (start, id 字节序) 有序数组中的下界位置。 */

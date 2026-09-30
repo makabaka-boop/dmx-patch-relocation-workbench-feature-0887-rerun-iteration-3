@@ -7,6 +7,7 @@ import {
   MAX_UNIVERSE,
   MIN_UNIVERSE,
   PatchEngine,
+  SwapPreview,
   TrialResult,
   endOf,
   parsePatch,
@@ -86,6 +87,12 @@ export default function App() {
   const [lookup, setLookup] = useState("");
   const [cap, setCap] = useState(200);
 
+  // 双灯具原子互换：两个逐字节 id 入口与预演结论。
+  // 预演携带引擎修订；任何成功写回（单灯提交/互换提交/导入替换）后，旧预演即过期。
+  const [swapIdA, setSwapIdA] = useState("");
+  const [swapIdB, setSwapIdB] = useState("");
+  const [swapPreview, setSwapPreview] = useState<SwapPreview | null>(null);
+
   // 修订补丁复核：结论、复核错误横幅、生成结果用的基线快照
   const [review, setReview] = useState<ReviewResolution | null>(null);
   const [reviewError, setReviewError] = useState<ReviewInputError | null>(null);
@@ -114,10 +121,11 @@ export default function App() {
     setTrial(null);
     setLookup("");
     setCap(200);
-    // 基线被整体替换：撤销任何既有复核结论与候选
+    // 基线被整体替换：撤销任何既有复核结论、候选与互换预演
     setReview(null);
     setReviewError(null);
     setReviewBaseline([]);
+    setSwapPreview(null);
   }
 
   function failImport() {
@@ -205,7 +213,8 @@ export default function App() {
     setStartInput(String(r.targetStart));
     setTrial(engine.trialMove(selectedId, r.targetUniverse, r.targetStart));
     // 引擎补丁被改写：旧复核结论针对的是旧基线快照，立即撤销；
-    // 同时推进修订号——任何迟到的候选读取都不得把试调前的基线放回审核区
+    // 同时推进修订号——任何迟到的候选读取都不得把试调前的基线放回审核区。
+    // 既有双灯互换预演同样过期（保留展示、禁止提交，要求重新预演）。
     revisionRef.current += 1;
     setReview(null);
     setReviewError(null);
@@ -216,6 +225,83 @@ export default function App() {
         <>
           已提交：<IdText id={selectedId} /> → universe {r.targetUniverse} 起始{" "}
           {r.targetStart}，冲突组已重算。
+        </>
+      ),
+    });
+  }
+
+  /** 双灯具原子互换预演：两个 id 均逐字节使用输入框内容（不 trim、不折叠空白）。 */
+  function runSwapPreview() {
+    if (!engine) return;
+    if (swapIdA === "" || swapIdB === "" || swapIdA === swapIdB) {
+      setNotice({
+        kind: "error",
+        text: "请逐字节输入两个不同的灯具 id（不做 trim；首尾/连续空格同样有效）。",
+      });
+      return;
+    }
+    const p = engine.previewSwap(swapIdA, swapIdB);
+    if (!p) {
+      // id 之一不存在：只提示，不改变补丁、冲突组、既有预演或复核结论
+      setNotice({
+        kind: "warn",
+        text: (
+          <>
+            未找到互换灯具（<IdText id={swapIdA} /> / <IdText id={swapIdB} />
+            ）：id 须逐字节存在且互不相同。
+          </>
+        ),
+      });
+      return;
+    }
+    setSwapPreview(p);
+    setNotice(null);
+  }
+
+  /** 互换提交：仅当预演修订仍为当前修订时由引擎一次生效；过期则要求重新预演。 */
+  function commitSwap() {
+    if (!engine || !swapPreview) return;
+    const result = engine.commitSwap(swapPreview);
+    if (result.status === "stale") {
+      // 过期：补丁、冲突组、复核与下载一律不变
+      setNotice({
+        kind: "error",
+        text: "互换预演已过期（引擎修订已推进）：请重新预演后再提交。",
+      });
+      return;
+    }
+    if (result.status === "rejected" || !result.preview) {
+      // 当前补丁上的统一核验未过（与预演后发生的其他写回无关）：补丁保持不变
+      setSwapPreview(result.preview);
+      setNotice({
+        kind: "warn",
+        text: "原子互换被拒绝：候选补丁存在越界、两灯相互重叠或与其他灯具的新增冲突，补丁保持不变。",
+      });
+      return;
+    }
+    // 一次生效：页面、导出与既有复核状态全部对应同一新快照
+    const p = result.preview;
+    setGroups(engine.getGroups());
+    setSwapPreview(p);
+    revisionRef.current += 1;
+    setReview(null);
+    setReviewError(null);
+    setReviewBaseline([]);
+    // 若当前选中的是互换灯之一，详情与试移面板同步到新位置
+    if (selectedId === p.a.fixture.id || selectedId === p.b.fixture.id) {
+      const side = selectedId === p.a.fixture.id ? p.a : p.b;
+      setUniInput(String(side.fixture.universe));
+      setStartInput(String(side.fixture.start));
+      setTrial(
+        engine.trialMove(side.fixture.id, side.fixture.universe, side.fixture.start),
+      );
+    }
+    setNotice({
+      kind: "ok",
+      text: (
+        <>
+          已原子互换：<IdText id={p.a.fixture.id} /> ↔ <IdText id={p.b.fixture.id} />
+          （各自 footprint 不变），冲突组已按完整候选补丁重算。
         </>
       ),
     });
@@ -447,6 +533,60 @@ export default function App() {
             </p>
           )}
         </section>
+
+        <section className="panel swap">
+          <h2>双灯具原子互换</h2>
+          <p className="muted review-rule">
+            逐字节输入两个不同 id：互换各自 <strong>universe 与起始通道</strong>，footprint
+            仍随原灯具。预演在<strong>完整候选补丁</strong>上统一核验通道上界、两灯相互重叠及与其他灯具的
+            <strong> 新增冲突</strong>（允许保留旧冲突对），不使用逐盏试移的临时状态。提交仅在预演修订仍为
+            当前修订时一次生效；写回后既有修订复核立即失效。
+          </p>
+          <form
+            className="swap-form"
+            onSubmit={(e) => {
+              e.preventDefault();
+              runSwapPreview();
+            }}
+          >
+            <label>
+              灯具 A（逐字节 id）
+              <input
+                value={swapIdA}
+                onChange={(e) => setSwapIdA(e.target.value)}
+                placeholder="id A，不 trim、不折叠空格"
+                aria-label="互换灯具 A 的 id"
+                spellCheck={false}
+              />
+            </label>
+            <span className="swap-arrow" aria-hidden="true">
+              ⇄
+            </span>
+            <label>
+              灯具 B（逐字节 id）
+              <input
+                value={swapIdB}
+                onChange={(e) => setSwapIdB(e.target.value)}
+                placeholder="id B，不 trim、不折叠空格"
+                aria-label="互换灯具 B 的 id"
+                spellCheck={false}
+              />
+            </label>
+            <button type="submit" disabled={!engine}>
+              预演互换
+            </button>
+          </form>
+          {swapPreview ? (
+            <SwapPreviewView
+              preview={swapPreview}
+              currentRevision={engine?.revision ?? 0}
+              onCommit={commitSwap}
+              onSelect={selectFixture}
+            />
+          ) : (
+            <p className="muted">{engine ? "输入两具灯具的 id 后点击“预演互换”。" : "请先导入补丁。"}</p>
+          )}
+        </section>
       </main>
 
       <section className="panel review">
@@ -550,4 +690,93 @@ export default function App() {
 /** 位置预览：u=universe, 区间 [start, start+footprint-1]。 */
 function formatPos(f: Fixture): string {
   return `u${f.universe} · ${f.start}–${endOf(f)}（fp ${f.footprint}）`;
+}
+
+/** 双灯具原子互换预演视图：两灯原位、目标位置及候选冲突变化。 */
+function SwapPreviewView({
+  preview,
+  currentRevision,
+  onCommit,
+  onSelect,
+}: {
+  preview: SwapPreview;
+  currentRevision: number;
+  onCommit: () => void;
+  onSelect: (id: string) => void;
+}) {
+  const stale = preview.revision !== currentRevision;
+  return (
+    <div className="swap-preview" data-testid="swap-preview">
+      <p className="muted" data-testid="swap-revision">
+        预演修订 #{preview.revision}
+        {stale ? "（已过期）" : ""}
+      </p>
+      <div className="swap-sides">
+        {[preview.a, preview.b].map((side, i) => (
+          <div
+            className="swap-side"
+            key={side.fixture.id}
+            data-swap-side={i === 0 ? "a" : "b"}
+          >
+            <h3>
+              {i === 0 ? "灯具 A" : "灯具 B"}：
+              <IdText id={side.fixture.id} />
+            </h3>
+            <p className="swap-pos">
+              原位：{formatPos(side.fixture)}
+              <br />
+              目标：u{side.targetUniverse} · {side.targetStart}–
+              {side.targetStart + side.fixture.footprint - 1}（fp {side.fixture.footprint}）
+              {!side.inBounds ? (
+                <span className="warn-text"> ⚠ 超出通道上界（start+footprint &gt; 513）</span>
+              ) : null}
+            </p>
+            <div>
+              <h4>原位直接冲突（{side.origin.length}）</h4>
+              <IdList ids={side.origin} onSelect={onSelect} />
+            </div>
+            <div>
+              <h4>候选目标位冲突（{side.target.length}）</h4>
+              <IdList ids={side.target} onSelect={onSelect} />
+            </div>
+            {side.added.length > 0 ? (
+              <div className="swap-delta">
+                <h4 className="warn-text">新增冲突（{side.added.length}）</h4>
+                <IdList ids={side.added} onSelect={onSelect} />
+              </div>
+            ) : null}
+            {side.removed.length > 0 ? (
+              <div className="swap-delta">
+                <h4 className="ok-text">消解冲突（{side.removed.length}）</h4>
+                <IdList ids={side.removed} onSelect={onSelect} />
+              </div>
+            ) : null}
+          </div>
+        ))}
+      </div>
+      {preview.mutualOverlap ? (
+        <p className="warn-text" data-testid="swap-mutual">
+          两灯互换后在新位置上相互重叠：原子互换被禁止，补丁保持不变。
+        </p>
+      ) : null}
+      {stale ? (
+        <p className="warn-text" data-testid="swap-stale">
+          预演依据的引擎修订（#{preview.revision}）已不是当前修订（#{currentRevision}）：请重新预演后再提交。
+        </p>
+      ) : preview.canCommit ? (
+        <>
+          <p className="ok-text" data-testid="swap-ok">
+            完整候选补丁核验通过：通道合法、两灯不重叠、对其他灯具无新增冲突，可一次原子提交。
+          </p>
+          <button className="commit" onClick={onCommit}>
+            提交原子互换
+          </button>
+        </>
+      ) : (
+        <p className="warn-text" data-testid="swap-blocked">
+          候选补丁不合法（越界/相互重叠/存在新增冲突）：提交已禁止，补丁保持不变。
+        </p>
+      )}
+    </div>
+  );
 }

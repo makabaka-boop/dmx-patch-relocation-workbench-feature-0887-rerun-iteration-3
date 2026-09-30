@@ -376,3 +376,65 @@ tr.row-adopt td:first-child {
 tr.row-reject {
   opacity: 0.75;
 }
+
+.swap-form {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+
+.swap-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--muted);
+  flex: 1 1 180px;
+}
+
+.swap-form input {
+  width: 100%;
+  color: var(--text);
+}
+
+.swap-arrow {
+  font-size: 18px;
+  color: var(--muted);
+  padding-bottom: 6px;
+}
+
+.swap-sides {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.swap-side {
+  border: 1px solid var(--panel-edge);
+  border-radius: 4px;
+  padding: 8px 10px;
+}
+
+.swap-side h3 {
+  margin-top: 0;
+}
+
+.swap-side h4 {
+  font-size: 12px;
+  margin: 8px 0 4px;
+  color: var(--muted);
+  font-weight: 400;
+}
+
+.swap-pos {
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+.swap-delta {
+  border-top: 1px dashed var(--panel-edge);
+  margin-top: 6px;
+  padding-top: 4px;
+}
