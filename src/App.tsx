@@ -7,6 +7,7 @@ import {
   MAX_UNIVERSE,
   MIN_UNIVERSE,
   PatchEngine,
+  SwapTrialResult,
   TrialResult,
   endOf,
   parsePatch,
@@ -86,6 +87,14 @@ export default function App() {
   const [lookup, setLookup] = useState("");
   const [cap, setCap] = useState(200);
 
+  // 双灯具原子互换：两个逐字节 id 输入、预演结果、引擎修订号镜像
+  // （引擎是可变对象，修订号镜像仅用于驱动界面上的“预演已过期”提示；
+  // 过期判定以引擎 commitSwap 的权威检查为准）
+  const [swapA, setSwapA] = useState("");
+  const [swapB, setSwapB] = useState("");
+  const [swapPreview, setSwapPreview] = useState<SwapTrialResult | null>(null);
+  const [engineRev, setEngineRev] = useState(0);
+
   // 修订补丁复核：结论、复核错误横幅、生成结果用的基线快照
   const [review, setReview] = useState<ReviewResolution | null>(null);
   const [reviewError, setReviewError] = useState<ReviewInputError | null>(null);
@@ -114,6 +123,11 @@ export default function App() {
     setTrial(null);
     setLookup("");
     setCap(200);
+    // 基线整体替换：互换预演与输入一并作废（新引擎修订号从 0 重新计）
+    setSwapA("");
+    setSwapB("");
+    setSwapPreview(null);
+    setEngineRev(eng.revision);
     // 基线被整体替换：撤销任何既有复核结论与候选
     setReview(null);
     setReviewError(null);
@@ -204,6 +218,8 @@ export default function App() {
     setUniInput(String(r.targetUniverse));
     setStartInput(String(r.targetStart));
     setTrial(engine.trialMove(selectedId, r.targetUniverse, r.targetStart));
+    // 引擎修订号已递增：镜像给界面，既有互换预演随之显示“已过期”
+    setEngineRev(engine.revision);
     // 引擎补丁被改写：旧复核结论针对的是旧基线快照，立即撤销；
     // 同时推进修订号——任何迟到的候选读取都不得把试调前的基线放回审核区
     revisionRef.current += 1;
@@ -216,6 +232,77 @@ export default function App() {
         <>
           已提交：<IdText id={selectedId} /> → universe {r.targetUniverse} 起始{" "}
           {r.targetStart}，冲突组已重算。
+        </>
+      ),
+    });
+  }
+
+  /** 互换预演：两个 id 逐字节使用输入框内容（不 trim、不折叠空白）。 */
+  function runSwapPreview() {
+    if (!engine) return;
+    const r = engine.trialSwap(swapA, swapB);
+    if (!r) {
+      // 预演失败：只提示，不改变补丁、冲突组与既有预演之外的任何状态
+      setSwapPreview(null);
+      setNotice({
+        kind: "error",
+        text: "互换预演失败：两个输入须是补丁中两具不同灯具的 id（逐字节匹配，含首尾/连续空格）。",
+      });
+      return;
+    }
+    setSwapPreview(r);
+    setNotice(null);
+  }
+
+  function submitSwapPreview(e: FormEvent) {
+    e.preventDefault();
+    runSwapPreview();
+  }
+
+  function commitSwap() {
+    if (!engine || !swapPreview) return;
+    const r = engine.commitSwap(swapPreview.a.id, swapPreview.b.id, swapPreview.revision);
+    if (r.status === "stale") {
+      // 过期：补丁、冲突组、复核与下载一律不变，要求重新预演
+      setNotice({
+        kind: "warn",
+        text: "互换预演已过期（引擎修订已变）：补丁保持不变，请重新预演后再提交。",
+      });
+      return;
+    }
+    if (r.status === "rejected") {
+      // 拒绝：补丁、冲突组、复核与下载一律不变
+      setNotice({
+        kind: "warn",
+        text: "互换候选不合法（通道上界/两灯相互重叠/新增冲突），提交被拒绝，补丁保持不变。",
+      });
+      return;
+    }
+    // 一次生效：页面、导出与复核状态统一落到同一新快照
+    setGroups(engine.getGroups());
+    setEngineRev(engine.revision);
+    setSwapPreview(null);
+    // 试移面板若正显示被互换的灯具，刷新到其新位置
+    if (selectedId) {
+      const f = engine.getFixture(selectedId);
+      if (f) {
+        setUniInput(String(f.universe));
+        setStartInput(String(f.start));
+        setTrial(engine.trialMove(f.id, f.universe, f.start));
+      }
+    }
+    // 引擎补丁被改写：旧复核结论针对的是旧基线快照，立即撤销；
+    // 推进修订号，迟到的候选读取不得落地
+    revisionRef.current += 1;
+    setReview(null);
+    setReviewError(null);
+    setReviewBaseline([]);
+    setNotice({
+      kind: "ok",
+      text: (
+        <>
+          已原子互换：<IdText id={r.trial.a.id} /> ⇄ <IdText id={r.trial.b.id} />
+          ，冲突组已重算。
         </>
       ),
     });
@@ -258,7 +345,7 @@ export default function App() {
       if (revisionRef.current === revision) setReviewError("READ_FAILED");
       return;
     }
-    // 读取期间若发生候选重选、试调提交或基线重导入，修订号已变：
+    // 读取期间若发生候选重选、试调/互换提交或基线重导入，修订号已变：
     // 本结果针对的是旧文件或旧基线，必须丢弃——不得覆盖当前结论，
     // 不得恢复旧结论，也不得在新工程上留下过期审核。
     if (revisionRef.current !== revision) return;
@@ -449,6 +536,153 @@ export default function App() {
         </section>
       </main>
 
+      <section className="panel swap">
+        <h2>双灯具原子互换</h2>
+        <p className="muted review-rule">
+          按逐字节精确的两个不同 id 选灯，互换 universe 与起始通道（footprint 仍随原灯具）。
+          预演在完整候选补丁上统一检查通道上界、两灯相互重叠及与其他灯具的新增冲突，
+          不以“先移一灯”的临时状态作结论；提交仅在预演所依据的引擎修订仍为当前修订时一次生效，
+          过期须重新预演。拒绝或过期都不改变补丁、冲突组与下载。
+        </p>
+        <form className="lookup" onSubmit={submitSwapPreview}>
+          <input
+            value={swapA}
+            onChange={(e) => {
+              setSwapA(e.target.value);
+              setSwapPreview(null);
+            }}
+            placeholder="灯具 A id（逐字节匹配，含首尾/连续空格）"
+            aria-label="灯具 A id"
+            spellCheck={false}
+          />
+          <input
+            value={swapB}
+            onChange={(e) => {
+              setSwapB(e.target.value);
+              setSwapPreview(null);
+            }}
+            placeholder="灯具 B id（逐字节匹配，含首尾/连续空格）"
+            aria-label="灯具 B id"
+            spellCheck={false}
+          />
+          <button type="submit" disabled={!engine}>
+            预演互换
+          </button>
+        </form>
+        {swapPreview ? (
+          <div className="swap-preview">
+            <table className="review-table swap-table">
+              <thead>
+                <tr>
+                  <th></th>
+                  <th>id</th>
+                  <th>原位</th>
+                  <th>目标位</th>
+                  <th>通道上界</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>A</td>
+                  <td>
+                    <span data-testid="swap-a-id">
+                      <IdText id={swapPreview.a.id} />
+                    </span>
+                  </td>
+                  <td>{formatPos(swapPreview.a)}</td>
+                  <td>
+                    {formatTarget(
+                      swapPreview.aTargetUniverse,
+                      swapPreview.aTargetStart,
+                      swapPreview.a.footprint,
+                    )}
+                  </td>
+                  <td className={swapPreview.aFits ? "ok-text" : "warn-text"}>
+                    {swapPreview.aFits ? "≤512" : "越界"}
+                  </td>
+                </tr>
+                <tr>
+                  <td>B</td>
+                  <td>
+                    <span data-testid="swap-b-id">
+                      <IdText id={swapPreview.b.id} />
+                    </span>
+                  </td>
+                  <td>{formatPos(swapPreview.b)}</td>
+                  <td>
+                    {formatTarget(
+                      swapPreview.bTargetUniverse,
+                      swapPreview.bTargetStart,
+                      swapPreview.b.footprint,
+                    )}
+                  </td>
+                  <td className={swapPreview.bFits ? "ok-text" : "warn-text"}>
+                    {swapPreview.bFits ? "≤512" : "越界"}
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+            <div className="lists">
+              <div>
+                <h3>A 原位直接冲突（{swapPreview.aOrigin.length}）</h3>
+                <IdList ids={swapPreview.aOrigin} onSelect={selectFixture} />
+              </div>
+              <div>
+                <h3>A 目标位直接冲突（{swapPreview.aTarget.length}）</h3>
+                <IdList ids={swapPreview.aTarget} onSelect={selectFixture} />
+              </div>
+              <div>
+                <h3>B 原位直接冲突（{swapPreview.bOrigin.length}）</h3>
+                <IdList ids={swapPreview.bOrigin} onSelect={selectFixture} />
+              </div>
+              <div>
+                <h3>B 目标位直接冲突（{swapPreview.bTarget.length}）</h3>
+                <IdList ids={swapPreview.bTarget} onSelect={selectFixture} />
+              </div>
+            </div>
+            <p className={swapPreview.mutualOverlap ? "warn-text" : "ok-text"}>
+              {swapPreview.mutualOverlap
+                ? "互换后两灯相互重叠。"
+                : "互换后两灯互不重叠。"}
+            </p>
+            {swapPreview.newPairs.length > 0 ? (
+              <div className="swap-pairs">
+                <h3>新增冲突对（{swapPreview.newPairs.length}）</h3>
+                <ul className="adopted-list">
+                  {swapPreview.newPairs.map(([x, y], i) => (
+                    <li key={i} data-swap-pair={`${x}⇔${y}`}>
+                      <IdText id={x} /> ⇔ <IdText id={y} />
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : (
+              <p className="ok-text">无新增冲突对。</p>
+            )}
+            {swapPreview.revision !== engineRev ? (
+              <p className="warn-text" data-testid="swap-stale">
+                预演所依据的引擎修订已过期：补丁未变，请重新预演。
+              </p>
+            ) : swapPreview.canCommit ? (
+              <>
+                <p className="ok-text">候选补丁合法，可原子提交。</p>
+                <button className="commit" onClick={commitSwap}>
+                  提交原子互换
+                </button>
+              </>
+            ) : (
+              <p className="warn-text" data-testid="swap-blocked">
+                候选不合法（{swapBlockReasons(swapPreview)}），提交已禁止，补丁保持不变。
+              </p>
+            )}
+          </div>
+        ) : (
+          <p className="muted">
+            {engine ? "输入两具灯具的 id 后点击“预演互换”。" : "请先导入补丁。"}
+          </p>
+        )}
+      </section>
+
       <section className="panel review">
         <h2>修订补丁复核</h2>
         <p className="muted review-rule">
@@ -550,4 +784,18 @@ export default function App() {
 /** 位置预览：u=universe, 区间 [start, start+footprint-1]。 */
 function formatPos(f: Fixture): string {
   return `u${f.universe} · ${f.start}–${endOf(f)}（fp ${f.footprint}）`;
+}
+
+/** 互换目标位预览：footprint 仍随原灯具。 */
+function formatTarget(universe: number, start: number, footprint: number): string {
+  return `u${universe} · ${start}–${start + footprint - 1}（fp ${footprint}）`;
+}
+
+/** 互换候选不合法的原因列表（通道上界 / 相互重叠 / 新增冲突对）。 */
+function swapBlockReasons(p: SwapTrialResult): string {
+  const reasons: string[] = [];
+  if (!p.aFits || !p.bFits) reasons.push("通道上界越界");
+  if (p.mutualOverlap) reasons.push("两灯相互重叠");
+  if (p.newPairs.length > 0) reasons.push(`新增 ${p.newPairs.length} 对冲突`);
+  return reasons.join("、");
 }

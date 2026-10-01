@@ -339,6 +339,21 @@ input:focus {
   min-height: 0;
 }
 
+.swap {
+  margin-top: 16px;
+  min-height: 0;
+}
+
+.swap-preview .lists {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+}
+
+.swap-pairs ul {
+  margin-top: 4px;
+}
+
 .review-rule {
   font-size: 12px;
   line-height: 1.7;
